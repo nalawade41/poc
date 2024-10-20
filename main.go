@@ -37,7 +37,7 @@ type TrackedPost struct {
 func main() {
 	// Connect to MongoDB
 	var err error
-	mongoClient, err = mongo.Connect(context.TODO(), options.Client().ApplyURI("mongodb://localhost:27017"))
+	mongoClient, err := mongo.Connect(context.TODO(), options.Client().ApplyURI("mongodb://admin:password@localhost:27017"))
 	if err != nil {
 		log.Fatal(err)
 	}
