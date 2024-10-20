@@ -15,7 +15,7 @@ import (
 	"go.mongodb.org/mongo-driver/mongo/readpref"
 )
 
-const maxRequestsPerMinute = 60
+const maxRequestsPerMinute = 80
 const pollInterval = 30 * time.Second // Adjust the polling interval as necessary
 
 // Rate limiter to enforce the API rate limit
@@ -112,15 +112,19 @@ func updatePostTracking(postID, subreddit string, lastProcessed, lastCommentChec
 
 // Monitor a specific subreddit
 func monitorSubreddit(ctx context.Context, subreddit string, keywords []string) {
-	client, err := reddit.NewClient(reddit.Credentials{
-		ID:       "your-client-id",
-		Secret:   "your-client-secret",
-		Username: "user-username",
-		Password: "user-password",
-	})
-	if err != nil {
-		log.Fatal(err)
-	}
+	//TODO: Need to figure out how to authenticate with Reddit API
+	//client, err := reddit.NewClient(reddit.Credentials{
+	//	ID:       "73gn7TG1Skgbyl8Ys9-kfA",
+	//	Secret:   "5DhsgQ6IT0Oh1B4MIHOWvTcGtOMR6A",
+	//	Username: "Impossible-Fun7405",
+	//	Password: "abcABC1!",
+	//})
+	//if err != nil {
+	//	log.Fatal(err)
+	//}
+
+	// For current use-case we will use the default client
+	client := reddit.DefaultClient()
 
 	for {
 		select {
@@ -128,7 +132,7 @@ func monitorSubreddit(ctx context.Context, subreddit string, keywords []string) 
 			fmt.Println("Stopping monitoring for subreddit:", subreddit)
 			return
 		case <-rateLimiter: // Enforce rate limit
-			posts, _, err := client.Subreddit.NewPosts(ctx, subreddit, &reddit.ListOptions{
+			posts, _, err := client.Subreddit.NewPosts(ctx, "golang", &reddit.ListOptions{
 				Limit: 100,
 			})
 			if err != nil {
