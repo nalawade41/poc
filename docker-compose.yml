@@ -1,0 +1,18 @@
+version: '3.8'  # Version of a docker-compose file
+
+services:
+  mongodb:
+    image: mongo:latest # Use the latest official MongoDB image
+    container_name: mongodb-container
+    ports:
+      - "27017:27017" # Map port 27017 from the container to the host
+    volumes:
+      - mongo-data:/data/db # Persist data in a named Docker volume
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: admin # Set the root username
+      MONGO_INITDB_ROOT_PASSWORD: password # Set the root password
+    restart: unless-stopped
+
+volumes:
+  mongo-data:
+    driver: local # Use a local volume to persist data
