@@ -9,6 +9,7 @@ import (
 	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
+// TODO: Abstract this to config
 const mongoURI = "mongodb://admin:password@localhost:27017"
 
 var (
