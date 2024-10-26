@@ -17,7 +17,7 @@ import (
 	"go.mongodb.org/mongo-driver/mongo/readpref"
 )
 
-const maxRequestsPerMinute = 95
+const maxRequestsPerMinute = 60
 const workerCount = 5                  // Number of workers in the pool
 const pollInterval = 600 * time.Second // Adjust the polling interval as necessary
 const maxRetries = 3                   // Maximum retry attempts for failed jobs
@@ -27,6 +27,9 @@ var trackedPostsCollection *mongo.Collection
 var postsCollection *mongo.Collection
 var commentsCollection *mongo.Collection
 var activeJobs sync.Map
+var requestCounter int32          // Global request counter
+var firstRequestOnce sync.Once    // Ensures the timer starts only once
+var cancelFunc context.CancelFunc // Global cancel function for stopping execution
 
 // TrackedPost MongoDB schema: tracked_posts
 type TrackedPost struct {
@@ -62,6 +65,9 @@ func main() {
 		log.Fatal("Could not connect to MongoDB:", err)
 	}
 
+	// Start the counter logging goroutine
+	go logRequestRate()
+
 	// Get the collection where we will store tracked posts
 	trackedPostsCollection = mongoClient.Database("reddit_tracker").Collection("tracked_posts")
 	postsCollection = trackedPostsCollection.Database().Collection("posts")
@@ -71,17 +77,18 @@ func main() {
 	subreddits := []string{"golang", "programming"}
 	keywords := []string{"Goroutine", "Channel", "Concurrency"}
 
+	// Create context to allow graceful shutdown
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cancelFunc = cancel // Assign cancel function to global variable
+
 	// Create a job queue and start the worker pool
 	jobQueue := make(chan Job, 100) // Buffer size of 100 jobs
 	var wg sync.WaitGroup
 	for i := 0; i < workerCount; i++ {
 		wg.Add(1)
-		go worker(jobQueue, &wg)
+		go worker(ctx, jobQueue, &wg)
 	}
-
-	// Create context to allow graceful shutdown
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 
 	// Schedule fetching new posts at regular intervals for each subreddit
 	for _, subreddit := range subreddits {
@@ -92,13 +99,32 @@ func main() {
 	wg.Wait()
 }
 
+// logRequestRate logs the number of requests made each minute and resets the counter.
+func logRequestRate() {
+	for range time.Tick(time.Minute) {
+		count := atomic.SwapInt32(&requestCounter, 0) // Reset counter atomically
+		log.Printf("Total requests to Reddit in the last minute: %d", count)
+	}
+}
+
 // Worker function to process jobs from the job queue
-func worker(jobQueue chan Job, wg *sync.WaitGroup) {
+func worker(ctx context.Context, jobQueue chan Job, wg *sync.WaitGroup) {
 	defer wg.Done()
 	client := reddit.DefaultClient()
 
 	for job := range jobQueue {
 		<-rateLimiter // Global rate limiter to control request rate
+		// Increment the request counter
+		atomic.AddInt32(&requestCounter, 1)
+		//// Start a timer only on the first request
+		firstRequestOnce.Do(func() {
+			fmt.Println("First request hit. Starting 1-minute timer.")
+			go func() {
+				time.Sleep(1 * time.Minute)
+				fmt.Println("1 minute passed since the first request. Stopping execution.")
+				cancelFunc() // Cancel context to stop execution
+			}()
+		})
 
 		var err error
 		switch job.RequestType {
@@ -107,40 +133,49 @@ func worker(jobQueue chan Job, wg *sync.WaitGroup) {
 			if err == nil {
 				decrementActiveJobs(job.Subreddit)
 			} else {
-				job.RetryCount++
-				if job.RetryCount >= maxRetries {
-					fmt.Printf("Max retries reached for NewPosts job in subreddit %s. Skipping...\n", job.Subreddit)
-					decrementActiveJobs(job.Subreddit)
-				} else {
-					fmt.Printf("Error processing NewPosts job for subreddit %s: %v. Retrying (%d/%d)...\n",
-						job.Subreddit, err, job.RetryCount, maxRetries)
-					jobQueue <- job // Requeue the job on failure
-				}
+				handleRetry(job, err, jobQueue)
 			}
 		case "Comments":
 			err = processComments(job.Post, job.Keywords, client)
 			if err == nil {
 				decrementActiveJobs(job.Post.SubredditName)
 			} else {
-				job.RetryCount++
-				if job.RetryCount >= maxRetries {
-					fmt.Printf("Max retries reached for Comments job in subreddit %s. Skipping...\n", job.Post.SubredditName)
-					decrementActiveJobs(job.Post.SubredditName)
-				} else {
-					fmt.Printf("Error processing Comments job for subreddit %s: %v. Retrying (%d/%d)...\n",
-						job.Post.SubredditName, err, job.RetryCount, maxRetries)
-					jobQueue <- job // Requeue the job on failure
-				}
+				handleRetry(job, err, jobQueue)
 			}
 		}
 	}
 }
 
+// Helper function to handle retries
+func handleRetry(job Job, err error, jobQueue chan Job) {
+	job.RetryCount++
+	if job.RetryCount >= maxRetries {
+		fmt.Printf("Max retries reached for %s job in subreddit %s. Skipping...\n", job.RequestType, job.Subreddit)
+		if job.RequestType == "NewPosts" {
+			decrementActiveJobs(job.Subreddit)
+		} else if job.RequestType == "Comments" {
+			decrementActiveJobs(job.Post.SubredditName)
+		}
+	} else {
+		fmt.Printf("Error processing %s job for subreddit %s: %v. Retrying (%d/%d)...\n",
+			job.RequestType, job.Subreddit, err, job.RetryCount, maxRetries)
+		jobQueue <- job // Requeue job on failure for retry
+	}
+}
+
 // Schedule fetching new posts for a subreddit at regular intervals
 func scheduleNewPostsFetching(ctx context.Context, jobQueue chan Job, subreddit string, keywords []string) {
+	// Run the job once initially
+	if incrementActiveJobs(subreddit) {
+		jobQueue <- Job{
+			RequestType: "NewPosts",
+			Subreddit:   subreddit,
+			Keywords:    keywords,
+		}
+	}
+
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
-
 	for {
 		select {
 		case <-ctx.Done():
@@ -149,7 +184,7 @@ func scheduleNewPostsFetching(ctx context.Context, jobQueue chan Job, subreddit 
 			if !incrementActiveJobs(subreddit) {
 				continue // Skip if there's already an active job for this subreddit
 			}
-
+			fmt.Printf("Scheduled job for subreddit: %s\n", subreddit)
 			// Enqueue a NewPosts job for this subreddit
 			jobQueue <- Job{
 				RequestType: "NewPosts",
@@ -166,15 +201,15 @@ func processNewPosts(subreddit string, keywords []string, client *reddit.Client,
 	if err != nil {
 		return fmt.Errorf("error fetching posts: %w", err)
 	}
-	fmt.Printf("Fetched %d posts from subreddit: %s\n", len(posts), subreddit)
 
 	var batchPosts []*reddit.Post
+	var counter int
 	for _, post := range posts {
 		postEditTime := post.Edited.Time
 		numComments := post.NumberOfComments
 
 		postNeedsReprocessing, commentsNeedFetching := shouldReprocessPost(post.ID, postEditTime, numComments)
-
+		counter++
 		if postNeedsReprocessing {
 			for _, keyword := range keywords {
 				if containsKeyword(post.Title, keyword) || containsKeyword(post.Body, keyword) {
@@ -200,6 +235,7 @@ func processNewPosts(subreddit string, keywords []string, client *reddit.Client,
 	if len(batchPosts) > 0 {
 		saveToDatabase(batchPosts)
 	}
+	fmt.Printf("Processed %d posts for subreddit: %s\n", counter, subreddit)
 	return nil
 }
 
@@ -216,6 +252,7 @@ func decrementActiveJobs(subreddit string) {
 		// Atomically decrement and check if count reaches zero
 		newCount := atomic.AddInt32(counter.(*int32), -1)
 		if newCount <= 0 {
+			fmt.Printf("Finished subreddit: %s\n", subreddit)
 			activeJobs.Delete(subreddit) // Remove entry if no active jobs
 		}
 	}
