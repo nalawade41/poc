@@ -24,6 +24,8 @@ const maxRetries = 3                   // Maximum retry attempts for failed jobs
 
 var rateLimiter = time.Tick(time.Minute / maxRequestsPerMinute)
 var trackedPostsCollection *mongo.Collection
+var postsCollection *mongo.Collection
+var commentsCollection *mongo.Collection
 var activeJobs sync.Map
 
 // TrackedPost MongoDB schema: tracked_posts
@@ -62,6 +64,8 @@ func main() {
 
 	// Get the collection where we will store tracked posts
 	trackedPostsCollection = mongoClient.Database("reddit_tracker").Collection("tracked_posts")
+	postsCollection = trackedPostsCollection.Database().Collection("posts")
+	commentsCollection = trackedPostsCollection.Database().Collection("comments")
 
 	// Example subreddits to monitor
 	subreddits := []string{"golang", "programming"}
@@ -164,6 +168,7 @@ func processNewPosts(subreddit string, keywords []string, client *reddit.Client,
 	}
 	fmt.Printf("Fetched %d posts from subreddit: %s\n", len(posts), subreddit)
 
+	var batchPosts []*reddit.Post
 	for _, post := range posts {
 		postEditTime := post.Edited.Time
 		numComments := post.NumberOfComments
@@ -174,7 +179,7 @@ func processNewPosts(subreddit string, keywords []string, client *reddit.Client,
 			for _, keyword := range keywords {
 				if containsKeyword(post.Title, keyword) || containsKeyword(post.Body, keyword) {
 					fmt.Printf("Found keyword '%s' in post: %s\n", keyword, post.Title)
-					saveToDatabase(post)
+					batchPosts = append(batchPosts, post)
 				}
 			}
 		}
@@ -190,6 +195,10 @@ func processNewPosts(subreddit string, keywords []string, client *reddit.Client,
 		}
 
 		updatePostTracking(post.ID, subreddit, time.Now(), time.Now(), postEditTime, numComments)
+	}
+
+	if len(batchPosts) > 0 {
+		saveToDatabase(batchPosts)
 	}
 	return nil
 }
@@ -219,15 +228,21 @@ func processComments(post *reddit.Post, keywords []string, client *reddit.Client
 		return fmt.Errorf("error fetching comments: %w", err)
 	}
 	fmt.Printf("Fetched %d comments for post: %s\n", len(thread.Comments), post.Title)
-
+	var batchComments []*reddit.Comment
 	for _, comment := range thread.Comments {
 		for _, keyword := range keywords {
 			if containsKeyword(comment.Body, keyword) {
 				fmt.Printf("Found keyword '%s' in comment: %s\n", keyword, comment.Body)
-				saveCommentToDatabase(comment)
+				batchComments = append(batchComments, comment)
 			}
 		}
 	}
+
+	if len(batchComments) > 0 {
+		fmt.Printf("Saved %d comments to database\n", len(batchComments))
+		saveCommentsToDatabase(batchComments)
+	}
+
 	return nil
 }
 
@@ -295,56 +310,52 @@ type CommentDocument struct {
 	CreatedAt time.Time `bson:"created_at"`
 }
 
-// Collection references for posts and comments
-var postsCollection *mongo.Collection
-var commentsCollection *mongo.Collection
-
-// Save a post to MongoDB
-func saveToDatabase(post *reddit.Post) {
-	// Convert the Reddit post to a PostDocument
-	postDoc := PostDocument{
-		PostID:      post.ID,
-		Title:       post.Title,
-		Body:        post.Body,
-		Subreddit:   post.SubredditName,
-		CreatedAt:   post.Created.Time,
-		UpdatedAt:   post.Edited.Time,
-		NumComments: post.NumberOfComments,
+// / Batch database updates for posts and comments
+func saveToDatabase(posts []*reddit.Post) {
+	var postDocs []interface{}
+	for _, post := range posts {
+		postDoc := PostDocument{
+			PostID:      post.ID,
+			Title:       post.Title,
+			Body:        post.Body,
+			Subreddit:   post.SubredditName,
+			CreatedAt:   post.Created.Time,
+			UpdatedAt:   post.Edited.Time,
+			NumComments: post.NumberOfComments,
+		}
+		postDocs = append(postDocs, postDoc)
 	}
 
-	// Use upsert to insert the post if it's new, or update it if it already exists
-	filter := bson.M{"post_id": postDoc.PostID}
-	update := bson.M{"$set": postDoc}
-
-	opts := options.Update().SetUpsert(true)
-	_, err := postsCollection.UpdateOne(context.TODO(), filter, update, opts)
-	if err != nil {
-		log.Println("Error saving post to database:", err)
-	} else {
-		fmt.Println("Saved post to database:", post.Title)
+	if len(postDocs) > 0 {
+		_, err := postsCollection.InsertMany(context.TODO(), postDocs)
+		if err != nil {
+			log.Println("Error saving posts to database:", err)
+		} else {
+			fmt.Println("Saved posts to database:", len(postDocs))
+		}
 	}
 }
 
 // Save a comment to MongoDB
-func saveCommentToDatabase(comment *reddit.Comment) {
-	// Convert the Reddit comment to a CommentDocument
-	commentDoc := CommentDocument{
-		CommentID: comment.ID,
-		PostID:    comment.ParentID,
-		Body:      comment.Body,
-		Author:    comment.Author,
-		CreatedAt: comment.Created.Time,
+func saveCommentsToDatabase(comments []*reddit.Comment) {
+	var commentDocs []interface{}
+	for _, comment := range comments {
+		commentDoc := CommentDocument{
+			CommentID: comment.ID,
+			PostID:    comment.ParentID,
+			Body:      comment.Body,
+			Author:    comment.Author,
+			CreatedAt: comment.Created.Time,
+		}
+		commentDocs = append(commentDocs, commentDoc)
 	}
 
-	// Use upsert to insert the comment if it's new, or update it if it already exists
-	filter := bson.M{"comment_id": commentDoc.CommentID}
-	update := bson.M{"$set": commentDoc}
-
-	opts := options.Update().SetUpsert(true)
-	_, err := commentsCollection.UpdateOne(context.TODO(), filter, update, opts)
-	if err != nil {
-		log.Println("Error saving comment to database:", err)
-	} else {
-		fmt.Println("Saved comment to database:", comment.Body)
+	if len(commentDocs) > 0 {
+		_, err := commentsCollection.InsertMany(context.TODO(), commentDocs)
+		if err != nil {
+			log.Println("Error saving comments to database:", err)
+		} else {
+			fmt.Println("Saved comments to database:", len(commentDocs))
+		}
 	}
 }
