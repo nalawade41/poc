@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/vartanbeno/go-reddit/v2/reddit"
@@ -15,14 +17,14 @@ import (
 	"go.mongodb.org/mongo-driver/mongo/readpref"
 )
 
-const maxRequestsPerMinute = 80
-const pollInterval = 30 * time.Second // Adjust the polling interval as necessary
+const maxRequestsPerMinute = 95
+const workerCount = 5                  // Number of workers in the pool
+const pollInterval = 600 * time.Second // Adjust the polling interval as necessary
+const maxRetries = 3                   // Maximum retry attempts for failed jobs
 
-// Rate limiter to enforce the API rate limit
 var rateLimiter = time.Tick(time.Minute / maxRequestsPerMinute)
-
-var mongoClient *mongo.Client
 var trackedPostsCollection *mongo.Collection
+var activeJobs sync.Map
 
 // TrackedPost MongoDB schema: tracked_posts
 type TrackedPost struct {
@@ -32,6 +34,15 @@ type TrackedPost struct {
 	LastCommentCheck time.Time `bson:"last_comment_check"`
 	LastPostEdit     time.Time `bson:"last_post_edit"`
 	NumComments      int       `bson:"num_comments"` // Track the number of comments
+}
+
+// Job Define a job type for the request queue
+type Job struct {
+	RequestType string       // "NewPosts" or "Comments"
+	Subreddit   string       // Subreddit to fetch posts from
+	Post        *reddit.Post // Post for fetching comments
+	Keywords    []string     // Keywords to monitor
+	RetryCount  int          // Number of retries for the job
 }
 
 func main() {
@@ -52,27 +63,184 @@ func main() {
 	// Get the collection where we will store tracked posts
 	trackedPostsCollection = mongoClient.Database("reddit_tracker").Collection("tracked_posts")
 
-	// Example subreddit to monitor
+	// Example subreddits to monitor
 	subreddits := []string{"golang", "programming"}
 	keywords := []string{"Goroutine", "Channel", "Concurrency"}
+
+	// Create a job queue and start the worker pool
+	jobQueue := make(chan Job, 100) // Buffer size of 100 jobs
+	var wg sync.WaitGroup
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go worker(jobQueue, &wg)
+	}
 
 	// Create context to allow graceful shutdown
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Monitor subreddits
+	// Schedule fetching new posts at regular intervals for each subreddit
 	for _, subreddit := range subreddits {
-		go monitorSubreddit(ctx, subreddit, keywords)
+		go scheduleNewPostsFetching(ctx, jobQueue, subreddit, keywords)
 	}
 
-	// Wait for a signal to stop (for demo, we run indefinitely)
-	select {}
+	// Wait for all workers to finish
+	wg.Wait()
 }
 
-// Check if post should be reprocessed
+// Worker function to process jobs from the job queue
+func worker(jobQueue chan Job, wg *sync.WaitGroup) {
+	defer wg.Done()
+	client := reddit.DefaultClient()
+
+	for job := range jobQueue {
+		<-rateLimiter // Global rate limiter to control request rate
+
+		var err error
+		switch job.RequestType {
+		case "NewPosts":
+			err = processNewPosts(job.Subreddit, job.Keywords, client, jobQueue)
+			if err == nil {
+				decrementActiveJobs(job.Subreddit)
+			} else {
+				job.RetryCount++
+				if job.RetryCount >= maxRetries {
+					fmt.Printf("Max retries reached for NewPosts job in subreddit %s. Skipping...\n", job.Subreddit)
+					decrementActiveJobs(job.Subreddit)
+				} else {
+					fmt.Printf("Error processing NewPosts job for subreddit %s: %v. Retrying (%d/%d)...\n",
+						job.Subreddit, err, job.RetryCount, maxRetries)
+					jobQueue <- job // Requeue the job on failure
+				}
+			}
+		case "Comments":
+			err = processComments(job.Post, job.Keywords, client)
+			if err == nil {
+				decrementActiveJobs(job.Post.SubredditName)
+			} else {
+				job.RetryCount++
+				if job.RetryCount >= maxRetries {
+					fmt.Printf("Max retries reached for Comments job in subreddit %s. Skipping...\n", job.Post.SubredditName)
+					decrementActiveJobs(job.Post.SubredditName)
+				} else {
+					fmt.Printf("Error processing Comments job for subreddit %s: %v. Retrying (%d/%d)...\n",
+						job.Post.SubredditName, err, job.RetryCount, maxRetries)
+					jobQueue <- job // Requeue the job on failure
+				}
+			}
+		}
+	}
+}
+
+// Schedule fetching new posts for a subreddit at regular intervals
+func scheduleNewPostsFetching(ctx context.Context, jobQueue chan Job, subreddit string, keywords []string) {
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if !incrementActiveJobs(subreddit) {
+				continue // Skip if there's already an active job for this subreddit
+			}
+
+			// Enqueue a NewPosts job for this subreddit
+			jobQueue <- Job{
+				RequestType: "NewPosts",
+				Subreddit:   subreddit,
+				Keywords:    keywords,
+			}
+		}
+	}
+}
+
+// Process new posts and enqueue jobs for fetching comments if needed
+func processNewPosts(subreddit string, keywords []string, client *reddit.Client, jobQueue chan Job) error {
+	posts, _, err := client.Subreddit.NewPosts(context.Background(), subreddit, &reddit.ListOptions{Limit: 100})
+	if err != nil {
+		return fmt.Errorf("error fetching posts: %w", err)
+	}
+	fmt.Printf("Fetched %d posts from subreddit: %s\n", len(posts), subreddit)
+
+	for _, post := range posts {
+		postEditTime := post.Edited.Time
+		numComments := post.NumberOfComments
+
+		postNeedsReprocessing, commentsNeedFetching := shouldReprocessPost(post.ID, postEditTime, numComments)
+
+		if postNeedsReprocessing {
+			for _, keyword := range keywords {
+				if containsKeyword(post.Title, keyword) || containsKeyword(post.Body, keyword) {
+					fmt.Printf("Found keyword '%s' in post: %s\n", keyword, post.Title)
+					saveToDatabase(post)
+				}
+			}
+		}
+
+		// Enqueue a job to fetch comments if needed
+		if commentsNeedFetching && numComments > 0 {
+			incrementActiveJobs(post.SubredditName)
+			jobQueue <- Job{
+				RequestType: "Comments",
+				Post:        post,
+				Keywords:    keywords,
+			}
+		}
+
+		updatePostTracking(post.ID, subreddit, time.Now(), time.Now(), postEditTime, numComments)
+	}
+	return nil
+}
+
+// Helper function to increment the job counter atomically
+func incrementActiveJobs(subreddit string) bool {
+	counter, _ := activeJobs.LoadOrStore(subreddit, new(int32))
+	// Atomically increment and check if it's the first active job
+	return atomic.AddInt32(counter.(*int32), 1) == 1
+}
+
+// Helper function to decrement the job counter atomically
+func decrementActiveJobs(subreddit string) {
+	if counter, exists := activeJobs.Load(subreddit); exists {
+		// Atomically decrement and check if count reaches zero
+		newCount := atomic.AddInt32(counter.(*int32), -1)
+		if newCount <= 0 {
+			activeJobs.Delete(subreddit) // Remove entry if no active jobs
+		}
+	}
+}
+
+// Process comments for a post
+func processComments(post *reddit.Post, keywords []string, client *reddit.Client) error {
+	thread, _, err := client.Post.Get(context.Background(), post.ID)
+	if err != nil {
+		return fmt.Errorf("error fetching comments: %w", err)
+	}
+	fmt.Printf("Fetched %d comments for post: %s\n", len(thread.Comments), post.Title)
+
+	for _, comment := range thread.Comments {
+		for _, keyword := range keywords {
+			if containsKeyword(comment.Body, keyword) {
+				fmt.Printf("Found keyword '%s' in comment: %s\n", keyword, comment.Body)
+				saveCommentToDatabase(comment)
+			}
+		}
+	}
+	return nil
+}
+
+func containsKeyword(text, keyword string) bool {
+	return len(text) > 0 && (stringContains(text, keyword))
+}
+
+func stringContains(text, keyword string) bool {
+	return strings.Contains(strings.ToLower(text), strings.ToLower(keyword))
+}
+
 func shouldReprocessPost(postID string, lastPostEdit time.Time, numComments int) (bool, bool) {
 	var result TrackedPost
-
 	filter := bson.M{"post_id": postID}
 	err := trackedPostsCollection.FindOne(context.TODO(), filter).Decode(&result)
 	if errors.Is(err, mongo.ErrNoDocuments) {
@@ -82,14 +250,12 @@ func shouldReprocessPost(postID string, lastPostEdit time.Time, numComments int)
 		return false, false
 	}
 
-	// Reprocess the post if edited, fetch comments only if comment count increased
 	postNeedsReprocessing := lastPostEdit.After(result.LastPostEdit)
 	commentsNeedFetching := numComments > result.NumComments
 
 	return postNeedsReprocessing, commentsNeedFetching
 }
 
-// Update post tracking data in MongoDB
 func updatePostTracking(postID, subreddit string, lastProcessed, lastCommentCheck, lastPostEdit time.Time, numComments int) {
 	filter := bson.M{"post_id": postID}
 	update := bson.M{
@@ -99,119 +265,86 @@ func updatePostTracking(postID, subreddit string, lastProcessed, lastCommentChec
 			LastProcessed:    lastProcessed,
 			LastCommentCheck: lastCommentCheck,
 			LastPostEdit:     lastPostEdit,
-			NumComments:      numComments, // Update the comment count
+			NumComments:      numComments,
 		},
 	}
-
-	opts := options.Update().SetUpsert(true) // Use upsert to insert if not exists
+	opts := options.Update().SetUpsert(true)
 	_, err := trackedPostsCollection.UpdateOne(context.TODO(), filter, update, opts)
 	if err != nil {
 		log.Println("Error updating post tracking in MongoDB:", err)
 	}
 }
 
-// Monitor a specific subreddit
-func monitorSubreddit(ctx context.Context, subreddit string, keywords []string) {
-	//TODO: Need to figure out how to authenticate with Reddit API
-	//client, err := reddit.NewClient(reddit.Credentials{
-	//	ID:       "73gn7TG1Skgbyl8Ys9-kfA",
-	//	Secret:   "5DhsgQ6IT0Oh1B4MIHOWvTcGtOMR6A",
-	//	Username: "Impossible-Fun7405",
-	//	Password: "abcABC1!",
-	//})
-	//if err != nil {
-	//	log.Fatal(err)
-	//}
-
-	// For current use-case we will use the default client
-	client := reddit.DefaultClient()
-
-	for {
-		select {
-		case <-ctx.Done():
-			fmt.Println("Stopping monitoring for subreddit:", subreddit)
-			return
-		case <-rateLimiter: // Enforce rate limit
-			posts, _, err := client.Subreddit.NewPosts(ctx, "golang", &reddit.ListOptions{
-				Limit: 100,
-			})
-			if err != nil {
-				log.Println("Error fetching posts:", err)
-				continue
-			}
-
-			// Process each post
-			for _, post := range posts {
-				// Get post-edit time and comment count
-				postEditTime := post.Edited.Time
-				numComments := post.NumberOfComments
-
-				// Check if the post or comments need reprocessing
-				postNeedsReprocessing, commentsNeedFetching := shouldReprocessPost(post.ID, postEditTime, numComments)
-
-				if postNeedsReprocessing {
-					for _, keyword := range keywords {
-						if containsKeyword(post.Title, keyword) || containsKeyword(post.Body, keyword) {
-							fmt.Printf("Found keyword '%s' in post: %s\n", keyword, post.Title)
-							saveToDatabase(post)
-						}
-					}
-
-					// Fetch comments only if the comment count has increased
-					if commentsNeedFetching {
-						comments, err := fetchComments(ctx, client, post)
-						if err != nil {
-							log.Println("Error fetching comments:", err)
-							continue
-						}
-
-						// Process comments
-						for _, comment := range comments {
-							for _, keyword := range keywords {
-								if containsKeyword(comment.Body, keyword) {
-									fmt.Printf("Found keyword '%s' in comment: %s\n", keyword, comment.Body)
-									saveCommentToDatabase(comment)
-								}
-							}
-						}
-					}
-
-					// Update tracking data for this post in MongoDB
-					updatePostTracking(post.ID, subreddit, time.Now(), time.Now(), postEditTime, numComments)
-				}
-			}
-
-			time.Sleep(pollInterval)
-		}
-	}
+// PostDocument Define a MongoDB schema for a Post document
+type PostDocument struct {
+	PostID      string    `bson:"post_id"`
+	Title       string    `bson:"title"`
+	Body        string    `bson:"body"`
+	Subreddit   string    `bson:"subreddit"`
+	CreatedAt   time.Time `bson:"created_at"`
+	UpdatedAt   time.Time `bson:"updated_at"`
+	NumComments int       `bson:"num_comments"`
 }
 
-func fetchComments(ctx context.Context, client *reddit.Client, post *reddit.Post) ([]*reddit.Comment, error) {
-	<-rateLimiter // Enforce rate limit
-
-	thread, _, err := client.Post.Get(ctx, post.ID)
-	if err != nil {
-		return nil, err
-	}
-
-	return thread.Comments, nil
+// CommentDocument Define a MongoDB schema for a Comment document
+type CommentDocument struct {
+	CommentID string    `bson:"comment_id"`
+	PostID    string    `bson:"post_id"`
+	Body      string    `bson:"body"`
+	Author    string    `bson:"author"`
+	CreatedAt time.Time `bson:"created_at"`
 }
 
-func containsKeyword(text, keyword string) bool {
-	return len(text) > 0 && (stringContains(text, keyword))
-}
+// Collection references for posts and comments
+var postsCollection *mongo.Collection
+var commentsCollection *mongo.Collection
 
-func stringContains(text, keyword string) bool {
-	// Case-insensitive comparison
-	return strings.Contains(strings.ToLower(text), strings.ToLower(keyword))
-}
-
+// Save a post to MongoDB
 func saveToDatabase(post *reddit.Post) {
-	// Implement your logic to save the post-data to the database here
-	fmt.Println("Saving post to database:", post.Title)
+	// Convert the Reddit post to a PostDocument
+	postDoc := PostDocument{
+		PostID:      post.ID,
+		Title:       post.Title,
+		Body:        post.Body,
+		Subreddit:   post.SubredditName,
+		CreatedAt:   post.Created.Time,
+		UpdatedAt:   post.Edited.Time,
+		NumComments: post.NumberOfComments,
+	}
+
+	// Use upsert to insert the post if it's new, or update it if it already exists
+	filter := bson.M{"post_id": postDoc.PostID}
+	update := bson.M{"$set": postDoc}
+
+	opts := options.Update().SetUpsert(true)
+	_, err := postsCollection.UpdateOne(context.TODO(), filter, update, opts)
+	if err != nil {
+		log.Println("Error saving post to database:", err)
+	} else {
+		fmt.Println("Saved post to database:", post.Title)
+	}
 }
 
+// Save a comment to MongoDB
 func saveCommentToDatabase(comment *reddit.Comment) {
-	// Implement your logic to save the comment data to the database here
-	fmt.Println("Saving comment to database:", comment.Body)
+	// Convert the Reddit comment to a CommentDocument
+	commentDoc := CommentDocument{
+		CommentID: comment.ID,
+		PostID:    comment.ParentID,
+		Body:      comment.Body,
+		Author:    comment.Author,
+		CreatedAt: comment.Created.Time,
+	}
+
+	// Use upsert to insert the comment if it's new, or update it if it already exists
+	filter := bson.M{"comment_id": commentDoc.CommentID}
+	update := bson.M{"$set": commentDoc}
+
+	opts := options.Update().SetUpsert(true)
+	_, err := commentsCollection.UpdateOne(context.TODO(), filter, update, opts)
+	if err != nil {
+		log.Println("Error saving comment to database:", err)
+	} else {
+		fmt.Println("Saved comment to database:", comment.Body)
+	}
 }
