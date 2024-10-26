@@ -23,6 +23,7 @@ func main() {
 	// Assign cancel function to global variable for debugging purposes
 	//constants.CancelFunc = cancel
 
+	// TODO: Abstract the db name to config
 	// Create a MongoDB client
 	mongoClient := nosql.NewMongoDBClient("reddit_tracker")
 

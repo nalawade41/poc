@@ -96,6 +96,7 @@ func ScheduleNewPostsFetching(ctx context.Context, jobQueue chan types.Job, subr
 
 	ticker := time.NewTicker(constants.PollInterval)
 	defer ticker.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
